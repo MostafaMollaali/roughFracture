@@ -1,0 +1,7 @@
+# ignore output directory
+_out/
+.DS_Store
+
+# Jupyter notebook checkpoint folders
+.ipynb_checkpoints
+
