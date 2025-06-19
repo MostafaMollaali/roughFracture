@@ -93,7 +93,7 @@
                 <convergence_criterion>
                     <type>PerComponentDeltaX</type>
                     <norm_type>NORM2</norm_type>
-                    <reltols>1e-14 1e-14</reltols>
+                    <reltols>1e-6 1e-6</reltols>
                 </convergence_criterion>
                 <time_discretization>
                     <type>BackwardEuler</type>
@@ -125,19 +125,6 @@
         </output>
     </time_loop>
     <parameters>
-		<parameter>
-            <name>fracture_thickness_const</name>
-            <type>Constant</type>
-            <value>1e-7</value>
-        </parameter>
-        <parameter>
-            <name>kappa1_frac</name>
-            <type>Constant</type>
-            <values>1e-18 0 0
-                0 1e-18 0
-                0 0 1e-18
-            </values>
-        </parameter>
         <parameter>
             <name>constant_porosity_parameter</name>
             <type>Constant</type>
@@ -146,7 +133,7 @@
         <parameter>
             <name>decay</name>
             <type>Constant</type>
-            <value>1e-10</value>
+            <value>1e-11</value>
         </parameter>
         <parameter>
             <name>c0</name>
