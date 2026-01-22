@@ -1,3 +1,10 @@
 
 # Local outputs
 _out*/
+# Jupyter checkpoints (all)
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Your generated outputs
+_plots_darcy/
+_runs_ogs/
