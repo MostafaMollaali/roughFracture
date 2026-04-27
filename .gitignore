@@ -1,10 +1,18 @@
-
 # Local outputs
+_out/
 _out*/
-# Jupyter checkpoints (all)
+_out_OGS/
+_runs_ogs/
+_plots_fields/
+_plots_darcy/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter notebook extras
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 
-# Your generated outputs
-_plots_darcy/
-_runs_ogs/
+# OS extras
+.DS_Store

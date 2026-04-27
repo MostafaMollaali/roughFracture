@@ -5,11 +5,10 @@ Synthetic Self-Affine Fracture Generation
 Standalone Python implementation following Algorithm 1 in the paper appendix
 (Stigsson 2025 / Casagrande 2018 / Bandis-Barton 1983 framework).
 
-KNOWN DISCREPANCY (code vs LaTeX, see NOTE below):
-  The F_slide formula in this file follows the LATEX text:
-      F_slide = sigma_N_cf * max(tan(beta) - tan(phi_b), 0) * A_cell
-  The original notebook used tan(phi_b + beta) instead, which is inconsistent
-  with the documented formula and inflates F_slide by up to ~17x at beta=35°.
+F_slide uses the Casagrande (2018) wedge criterion: tan(φ_b + β).
+  The alternative max(tan β − tan φ_b, 0) gives thresholds of 50–78° which
+  never trigger for typical fracture roughness. The LaTeX text was incorrect
+  and should be updated to match this implementation.
 
 References
 ----------
@@ -35,7 +34,7 @@ from numpy.fft import fftfreq, irfft2, rfftfreq
 # Input:
 #   JRC, sigma_n, (dx, dy), (lx_user, ly_user), b0, [lambda_min, lambda_max],
 #   shear_dir in {x, y}, shear_offset Δs, Δβ (b_step_deg), η (closure_frac),
-#   k_n (kn_joint), (phi_b, c_joint), guards (cos_eps, eps_nz), m_max, N_big.
+#   k_n (kn_joint), (phi_b, c_intact), guards (cos_eps, eps_nz), m_max, N_big.
 #
 # Output: (z_lower, z_upper, a_closed(x,y;sigma_n))
 #
@@ -45,8 +44,8 @@ from numpy.fft import fftfreq, irfft2, rfftfreq
 #   C1: build periodic z_big on N_big grid        [Eq. PSD: A(K)∝K^{-(H+1)}]
 #   C2: band-limit to K ∈ [K_min, K_max]
 #   C3: rescale to σ_δh,target at 1-mm lag        [Eq. discrete calibration]
-#   C4: center-crop → n_x × n_y; de-mean; detrend/taper
-#   C5: z_lower = -z0/2 - b0/2,  z_upper = +z0/2 + b0/2   [Eq. mated walls]
+#   C4: center-crop → n_x × n_y; de-mean; optional detrend/taper
+#   C5: z_lower = z0 - b0/2,     z_upper = z0 + b0/2       [Eq. mated walls]
 # Step D – Stress-dependent strength anchors      [get_phi_and_jcs_table]
 # Step E – Casagrande-type shear damage on z_d    [casagrande_shear]
 #   for m = 1..m_max:
@@ -82,10 +81,13 @@ CFG_DEFAULT = {
     "lambda_min": 4.0e-3,     # [m]  must be >= 4·dx
     "lambda_max": 0.05,       # [m]  must be <= min(lx, ly)
     # Fracture geometry
-    "b0": 5.0e-4,             # [m] initial mechanical aperture
+    "b0": 2.0e-4,             # [m] initial mechanical aperture
     # Strength / friction
     "phi_basic_deg": 30.0,    # [deg] base friction angle φ_b
-    "cohesion_joint_mpa": 0.5,# [MPa]
+    # Effective asperity cohesion at mm scale. Intact-rock cohesion (28 MPa) applies
+    # to field-scale fractures; at 1 mm grid scale breakage never triggers at
+    # 0.2–10 MPa. Use an effective value calibrated to produce realistic contact area.
+    "cohesion_intact_mpa": 0.5,   # [MPa] effective mm-scale asperity cohesion
     # Numerical guards
     "cos_eps": 1e-6,          # lower bound for cos(β) to avoid blow-up
     "tan_clip_deg": 89.5,     # clip angle (deg) for tan() argument
@@ -95,6 +97,8 @@ CFG_DEFAULT = {
     "b_step_deg": 0.5,        # Δβ increment [deg]
     "max_outer": 50,          # m_max
     "verbose": False,
+    "debug_casagrande": False,      # print shear-activation summary per case
+    "debug_contact_stages": False,  # print no-damage vs full-pipeline contact deltas
     # Normal stress cases [MPa]
     "sigmas_mpa": [0.2, 2.0, 10.0],
     # Contact / closure
@@ -109,9 +113,10 @@ CFG_DEFAULT = {
     "jrc_anch":       np.array([4.0, 7.0, 10.0]),
     "h_anch":         np.array([0.7, 0.8, 0.9]),
     "sig1mm_anch_mm": np.array([0.0969, 0.1440, 0.1910]),  # [mm]
-    # Post-processing
-    "detrend": True,
-    "edge_taper_nodes": 5,
+    # Post-processing (disabled by default to preserve periodic consistency
+    # with FFT Poisson solve + periodic shear roll).
+    "detrend": False,
+    "edge_taper_nodes": 0,
     "N_big": 2049,            # oversized FFT grid for center-crop
 }
 
@@ -121,12 +126,17 @@ def build_cfg(user: dict | None = None) -> dict:
     cfg = {**CFG_DEFAULT}
     if user:
         cfg.update(user)
+    # Backward compatibility for older configs.
+    if user and ("cohesion_intact_mpa" not in user) and ("cohesion_joint_mpa" in user):
+        cfg["cohesion_intact_mpa"] = cfg["cohesion_joint_mpa"]
     cfg["nx"] = int(round(cfg["lx_user"] / cfg["dx"])) + 1
     cfg["ny"] = int(round(cfg["ly_user"] / cfg["dy"])) + 1
     cfg["lx"] = cfg["dx"] * (cfg["nx"] - 1)
     cfg["ly"] = cfg["dy"] * (cfg["ny"] - 1)
     cfg["phi_basic_rad"] = math.radians(cfg["phi_basic_deg"])
-    cfg["cohesion_joint_pa"] = cfg["cohesion_joint_mpa"] * 1e6
+    cfg["cohesion_intact_pa"] = cfg["cohesion_intact_mpa"] * 1e6
+    # Keep legacy alias so old downstream code does not break.
+    cfg["cohesion_joint_pa"] = cfg["cohesion_intact_pa"]
     _validate_cfg(cfg)
     return cfg
 
@@ -331,17 +341,19 @@ def generate_correlated_surfaces(
     b0: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Two perfectly mated walls from one rough surface z0:
-      z_lower = -z0/2 - b0/2
-      z_upper = +z0/2 + b0/2
+    Two perfectly mated walls from one rough surface z0 [Eq. mated_walls]:
+      z_lower = z0 - b0/2
+      z_upper = z0 + b0/2
+    Both walls follow the same topography; gap = b0 everywhere when mated.
+    When b0 = 0 the walls coincide exactly (zero aperture).
     Returns (x, y, z_lower, z_upper).
     """
     if b0 is None:
         b0 = float(cfg["b0"])
     x, y, z = generate_surface_stigsson(jrc, cfg, seed, lambda_min, lambda_max)
     z0      = z - z.mean()
-    z_lower = -0.5 * z0 - 0.5 * b0
-    z_upper = +0.5 * z0 + 0.5 * b0
+    z_lower = z0 - 0.5 * b0
+    z_upper = z0 + 0.5 * b0
     return x, y, z_lower, z_upper
 
 
@@ -437,26 +449,37 @@ def calculate_forces_facetwise(
     if not np.any(facing_mask):
         return 0.0, 0.0
 
-    cos_eps      = float(cfg["cos_eps"])
     tan_clip_deg = float(cfg["tan_clip_deg"])
-    c_pa         = float(cfg["cohesion_joint_mpa"]) * 1e6
+    if ("cohesion_joint_mpa" in cfg) and (
+        ("cohesion_intact_mpa" not in cfg) or
+        (float(cfg["cohesion_joint_mpa"]) != float(cfg["cohesion_intact_mpa"]))
+    ):
+        c_mpa = float(cfg["cohesion_joint_mpa"])
+    else:
+        c_mpa = float(cfg.get("cohesion_intact_mpa", 0.5))
+    c_pa = c_mpa * 1e6
 
     beta_rad = np.deg2rad(beta_deg[facing_mask])
-    cos_b    = np.clip(np.cos(beta_rad), cos_eps, 1.0)
 
-    # Local effective normal stress: min(σ_n / cos(β), JCS)   Eq. (sigmaN_eff)
-    sigma_N = np.minimum(sigma_n_pa / cos_b, jcs_pa)
+    # Ensemble contact-area stress concentration (Stigsson approach).
+    # Project active facet areas onto horizontal; concentration = A_domain / A_contact.
+    # This is physically correct and does not diverge at steep β (unlike σ_n / cos β).
+    A_domain   = a_cell * float(beta_deg.size)
+    A_cf_total = float(np.sum(a_cell * np.cos(beta_rad)))
+    eps_a      = float(cfg.get("eps", 1e-12))
+    sigma_N    = min(sigma_n_pa * A_domain / max(A_cf_total, eps_a), jcs_pa)
 
-    # Shear resistance (Eq. F_shear)
-    F_shear_i = a_cell * (c_pa + sigma_N * math.tan(phi))
+    # Shear resistance (Eq. F_shear) — sum over all N_facing cells
+    n_facing  = int(np.sum(facing_mask))
+    F_shear   = float(n_facing) * a_cell * (c_pa + sigma_N * math.tan(phi))
 
     # Sliding driving — Casagrande wedge criterion: tan(φ_b + β)
     angle     = np.clip(phi_b + beta_rad,
                         -np.deg2rad(tan_clip_deg),
                          np.deg2rad(tan_clip_deg))
-    F_slide_i = a_cell * sigma_N * np.tan(angle)
+    F_slide   = float(np.sum(a_cell * sigma_N * np.tan(angle)))
 
-    return float(np.sum(F_shear_i)), float(np.sum(F_slide_i))
+    return F_shear, F_slide
 
 
 def clip_slope_in_direction(
@@ -494,12 +517,14 @@ def clip_slope_in_direction(
     gx_clip = gx.copy()
     gy_clip = gy.copy()
 
+    # Clip only uphill (positive) slopes at active nodes.
+    # Downhill slopes at the same nodes are not facing facets and must not be clipped.
     if direction == "x":
         m = active_nodes
-        gx_clip[m] = np.sign(gx[m]) * np.minimum(np.abs(gx[m]), tan_b_star)
+        gx_clip[m] = np.minimum(gx[m], tan_b_star)
     else:
         m = active_nodes
-        gy_clip[m] = np.sign(gy[m]) * np.minimum(np.abs(gy[m]), tan_b_star)
+        gy_clip[m] = np.minimum(gy[m], tan_b_star)
 
     delta_gx = gx_clip - gx
     delta_gy = gy_clip - gy
@@ -562,6 +587,7 @@ def casagrande_shear(
     if b_step_deg is None: b_step_deg = float(cfg.get("b_step_deg", 0.5))
     if max_outer  is None: max_outer  = int(cfg.get("max_outer",  50))
     if verbose    is None: verbose    = bool(cfg.get("verbose",  False))
+    debug_casa = bool(cfg.get("debug_casagrande", False))
 
     dx = float(cfg["dx"])
     dy = float(cfg["dy"])
@@ -572,6 +598,13 @@ def casagrande_shear(
     A_cell = dx * dy
 
     z = surface.copy()
+    z_initial = surface.copy()
+    beta_init_max = float(np.max(compute_apparent_dip_signed(z, dx, dy, direction)))
+    update_events = 0
+    updated_nodes_accum = 0
+    triggered_cells_accum = 0
+    max_dz_event = 0.0
+    outer_with_updates = 0
 
     for outer in range(max_outer):
         beta_deg = compute_apparent_dip_signed(z, dx, dy, direction)
@@ -628,11 +661,17 @@ def casagrande_shear(
                 if np.allclose(z_new, z):
                     b_star -= b_step_deg
                     continue
+                dz_field = np.abs(z_new - z)
+                dz = float(np.max(dz_field))
+                changed_nodes = int(np.count_nonzero(dz_field > 1e-14))
                 if verbose:
-                    dz = float(np.max(np.abs(z_new - z)))
                     print(f"      Updated at β*={b_star:.2f}°, max|Δz|={dz:.3e} m")
                 z = z_new
                 any_updated = True
+                update_events += 1
+                updated_nodes_accum += changed_nodes
+                triggered_cells_accum += int(np.sum(active_mask))
+                max_dz_event = max(max_dz_event, dz)
                 beta_deg = compute_apparent_dip_signed(z, dx, dy, direction)
                 # Stay at same β* to check if further clipping is needed
             else:
@@ -642,6 +681,28 @@ def casagrande_shear(
             if verbose:
                 print(f"  Outer {outer}: no updates, converged.")
             break
+        outer_with_updates += 1
+
+    if debug_casa:
+        beta_final_max = float(np.max(compute_apparent_dip_signed(z, dx, dy, direction)))
+        dz_total = np.abs(z - z_initial)
+        changed_nodes_total = int(np.count_nonzero(dz_total > 1e-14))
+        changed_pct = 100.0 * changed_nodes_total / float(z.size)
+        dz_rms = float(np.sqrt(np.mean(dz_total**2)))
+        dz_max = float(np.max(dz_total))
+        print(
+            f"  Casagrande activation: σ_n={sigma_n_mpa:.2f} MPa | "
+            f"events={update_events}, outer_iters_with_updates={outer_with_updates}, "
+            f"triggered_cells_total={triggered_cells_accum}"
+        )
+        print(
+            f"    β_max: {beta_init_max:.3f}° -> {beta_final_max:.3f}° | "
+            f"changed nodes={changed_nodes_total}/{z.size} ({changed_pct:.2f}%)"
+        )
+        print(
+            f"    |Δz| max_total={dz_max:.3e} m, rms_total={dz_rms:.3e} m, "
+            f"max_per_event={max_dz_event:.3e} m, changed_nodes_accum={updated_nodes_accum}"
+        )
 
     return z
 
@@ -663,6 +724,23 @@ def apply_shear_offset(z: np.ndarray, direction: str, shift: int = 1) -> np.ndar
         return np.roll(z, shift=shift, axis=1)
     else:
         raise ValueError("direction must be 'x' or 'y'")
+
+
+def peak_shear_displacement_cells(
+    jrc: float,
+    jcs_mpa: float,
+    sigma_n_mpa: float,
+    L_m: float,
+    cell_size: float,
+) -> int:
+    """
+    Peak shear displacement (Barton & Bandis 1982, Eq. 1):
+      u_peak = (JRC / 500) * (JCS / sigma_n)^0.33 * L   [same units as L]
+
+    Returns displacement rounded to nearest grid cell (minimum 1).
+    """
+    u_peak = (jrc / 500.0) * (jcs_mpa / max(sigma_n_mpa, 1e-3)) ** 0.33 * L_m
+    return max(1, int(round(u_peak / cell_size)))
 
 
 # ============================================================
@@ -717,9 +795,12 @@ def compute_midplane_aperture(
     normM = np.where(normM == 0.0, 1.0, normM)
     nzM  /= normM
 
-    # Aperture: max(Δz_c / n_{m,z}, 0)  (Eq. midplane_aperture)
-    eps = 1e-12
-    a = dz_c / (nzM + eps)
+    # Aperture: max(Δz_c · n_{m,z}, 0)  (Eq. midplane_aperture)
+    # Geometric fact: for two parallel tilted planes, the perpendicular aperture
+    # equals the vertical centroid separation scaled by the z-component of the
+    # midplane normal (cos of tilt angle). Dividing inflated apertures at steep
+    # tilts and caused a false singularity.
+    a = dz_c * nzM
     return np.maximum(a, 0.0)
 
 
@@ -728,6 +809,41 @@ def compute_midplane_aperture(
 # Eq. (bandis_closure), (closed_aperture)
 # ============================================================
 
+def bandis_params_from_jrc(
+    jrc: float,
+    jcs_mpa: float,
+    b0_m: float,
+    cfg: dict,
+) -> tuple[float, float]:
+    """
+    JRC/JCS-dependent Bandis stiffness and maximum closure.
+
+    Initial normal stiffness (Barton et al. 1985, Eq. 9):
+      k_ni = -7.15 + 1.75·JRC + 0.02·(JCS/E0)   [GPa/m]
+      where E0 = b0 in µm.
+
+    Maximum closure (Bandis et al. 1983, Table 5 fit):
+      Δb_m = η · b0   (η from cfg, or derived below)
+      Literature shows Δb_m ≈ b0 / (1 + 0.02·JCS·b0_mm^{-0.5})
+      — a simple JCS-dependent damping; use cfg["closure_frac"] as fallback.
+
+    Returns (kn_joint [Pa/m], delta_bm [m]).
+    """
+    b0_mm = b0_m * 1e3                               # m → mm  (Barton uses mm)
+
+    # k_ni (Barton et al. 1985, Eq. 9): E0 must be in mm, JCS in MPa → GPa/m
+    kni_gpa = -7.15 + 1.75 * jrc + 0.02 * (jcs_mpa / max(b0_mm, 1e-3))
+    kni_gpa = float(np.clip(kni_gpa, 1.0, 100.0))   # clamp to [1, 100] GPa/m
+    kn_pa_m = kni_gpa * 1e9                          # GPa/m → Pa/m
+
+    # Maximum closure fraction η (Bandis et al. 1983, Table 5 fit):
+    # rougher joints close proportionally more; bounded to [0.4, 0.9]
+    eta = float(np.clip(0.5 + 0.03 * jrc, 0.4, 0.9))
+    delta_bm = eta * b0_m
+
+    return kn_pa_m, delta_bm
+
+
 def apply_bandis_normal_closure(
     a: np.ndarray,
     sigma_n_mpa: float,
@@ -735,28 +851,37 @@ def apply_bandis_normal_closure(
     b0: float | None = None,
     kn_joint: float | None = None,
     closure_frac: float | None = None,
+    jrc: float | None = None,
+    jcs_mpa: float | None = None,
 ) -> tuple[np.ndarray, float]:
     """
     Hyperbolic normal closure (Bandis et al. 1983):
-      Δb_m = η · b0
       Δb_n = (σ_n / (σ_n + k_n · Δb_m)) · Δb_m       (Eq. bandis_closure)
       a_closed = max(a − Δb_n, 0)                      (Eq. closed_aperture)
 
+    If jrc and jcs_mpa are provided, k_n and Δb_m are derived from
+    Barton et al. (1985) / Bandis et al. (1983) instead of cfg constants.
+
     Returns (a_closed, delta_b_n [m]).
     """
-    if b0          is None: b0          = float(cfg["b0"])
-    if kn_joint    is None: kn_joint    = float(cfg["kn_joint"])
-    if closure_frac is None: closure_frac = float(cfg["closure_frac"])
+    if b0 is None: b0 = float(cfg["b0"])
+    sigma_n = float(sigma_n_mpa) * 1e6     # [Pa]
 
-    delta_bm = closure_frac * b0             # [m]
-    sigma_n  = float(sigma_n_mpa) * 1e6     # [Pa]
+    if jrc is not None and jcs_mpa is not None:
+        # Physics-based stiffness and closure from JRC/JCS
+        kn_joint, delta_bm = bandis_params_from_jrc(jrc, jcs_mpa, b0, cfg)
+    else:
+        # Fallback: cfg constants (backward-compatible)
+        if kn_joint   is None: kn_joint    = float(cfg["kn_joint"])
+        if closure_frac is None: closure_frac = float(cfg.get("closure_frac", 0.9))
+        delta_bm = closure_frac * b0
 
     if delta_bm <= 0.0 or sigma_n <= 0.0:
         return np.maximum(a, 0.0), 0.0
 
-    denom      = sigma_n + kn_joint * delta_bm
-    delta_b_n  = (sigma_n / denom) * delta_bm   # [m]
-    a_closed   = np.maximum(a - delta_b_n, 0.0)
+    denom     = sigma_n + kn_joint * delta_bm
+    delta_b_n = (sigma_n / denom) * delta_bm   # [m]
+    a_closed  = np.maximum(a - delta_b_n, 0.0)
     return a_closed, float(delta_b_n)
 
 
@@ -779,7 +904,7 @@ def run_one_case(
       a_raw, a_closed               – aperture fields (nx-1, ny-1)
       delta_b_n                     – scalar Bandis closure [m]
       contact                       – binary contact indicator
-      k_frac                        – cubic-law permeability [m²]
+      k_parallel_plate_proxy        – LCL/parallel-plate proxy permeability [m²]
     """
     if seed is None:
         seed = int(cfg.get("seed", 123))
@@ -806,9 +931,8 @@ def run_one_case(
         z_lower_d, z_upper_d = z_dmg, z_upper
 
     # ---- Step F.1: periodic shear offset ----------------------------
-    # Δs = Δx (for x) or Δy (for y)
+    # Fixed one-cell shift, consistent with the paper (Stigsson 2025).
     z_upper_shifted = apply_shear_offset(z_upper_d, direction, shift=1)
-    # (lower wall is not shifted; upper is displaced relative to lower)
 
     # ---- Step F.2: midplane aperture --------------------------------
     a_raw = compute_midplane_aperture(
@@ -816,13 +940,62 @@ def run_one_case(
     )
 
     # ---- Step F.3: Bandis normal closure ----------------------------
-    a_closed, delta_b_n = apply_bandis_normal_closure(a_raw, sigma_n_mpa, cfg)
+    # Pass jrc + jcs so k_n and Δb_m are derived from Barton/Bandis empirics.
+    _, jcs_pa_val = get_phi_and_jcs_table(sigma_n_mpa)
+    debug_contact = bool(cfg.get("debug_contact_stages", False))
+    if debug_contact:
+        z_upper_shifted_nodmg = apply_shear_offset(z_upper, direction, shift=1)
+        a_raw_nodmg = compute_midplane_aperture(
+            z_lower, z_upper_shifted_nodmg, float(cfg["dx"]), float(cfg["dy"])
+        )
+        a_closed_nodmg, _ = apply_bandis_normal_closure(
+            a_raw_nodmg, sigma_n_mpa, cfg,
+            jrc=jrc, jcs_mpa=jcs_pa_val / 1e6,
+        )
+
+    a_closed, delta_b_n = apply_bandis_normal_closure(
+        a_raw, sigma_n_mpa, cfg,
+        jrc=jrc, jcs_mpa=jcs_pa_val / 1e6,
+    )
 
     # ---- Contact indicator and permeability -------------------------
     tol     = float(cfg.get("contact_tol", 0.0))
     contact = (a_closed <= tol).astype(np.uint8)
+    if debug_contact:
+        ic_raw_nodmg = 100.0 * float(np.mean(a_raw_nodmg <= tol))
+        ic_raw_full  = 100.0 * float(np.mean(a_raw <= tol))
+        ic_cl_nodmg  = 100.0 * float(np.mean(a_closed_nodmg <= tol))
+        ic_cl_full   = 100.0 * float(np.mean(a_closed <= tol))
+        print(
+            f"  Contact stages: JRC={jrc:.1f}, σ_n={sigma_n_mpa:.2f} MPa | "
+            f"raw(no dmg)={ic_raw_nodmg:.3f}%, raw(full)={ic_raw_full:.3f}%"
+        )
+        print(
+            f"    closed(+Bandis only)={ic_cl_nodmg:.3f}%, "
+            f"closed(full)={ic_cl_full:.3f}%, "
+            f"ΔCasagrande={ic_cl_full - ic_cl_nodmg:.3f} %-points"
+        )
     a_pos   = np.maximum(a_closed, 0.0)
-    k_frac  = a_pos**2 / 12.0    # cubic-law permeability (Eq. cubic_law_k)
+    # Clamp aperture before cubic law so contact cells (a=0) don't yield k=0,
+    # which can produce a singular flow-solver system matrix.
+    a_min  = float(cfg.get("a_min_flow", 1e-8))   # [m] residual flow path
+    a_flow = np.maximum(a_pos, a_min)
+
+    # Optional roughness correction to cubic law (Zimmerman & Bodvarsson 1996, Eq. 4):
+    #   T = (a³/12) · (1 − 1.5·(σ_a/ā)²)³  valid for CV < 0.4 (open cells only).
+    # Disabled by default: all roughness in this model is explicitly resolved on the
+    # 1-mm grid (λ_min = 4 mm > dx), so there is no sub-grid roughness to correct for.
+    # Enable via cfg["roughness_correction"] = True only if sub-grid roughness is present.
+    if cfg.get("roughness_correction", False):
+        open_a = a_pos[a_pos > 0]
+        if len(open_a) > 0 and open_a.std() / open_a.mean() < 0.4:
+            cv   = float(open_a.std() / open_a.mean())
+            corr = max((1.0 - 1.5 * cv**2) ** 3, 0.1)
+        else:
+            corr = 1.0   # CV too high or no open cells: skip correction
+    else:
+        corr = 1.0
+    k_parallel_plate_proxy = corr * a_flow**2 / 12.0  # LCL/parallel-plate proxy
 
     # Reynolds number diagnostic (reference pressure gradient: ΔP/L from cfg)
     dP   = float(cfg.get("delta_p", 200.0))   # [Pa]  default OGS benchmark value
@@ -837,7 +1010,9 @@ def run_one_case(
         "a_closed": a_closed,
         "delta_b_n": delta_b_n,
         "contact": contact,
-        "k_frac": k_frac,
+        "k_parallel_plate_proxy": k_parallel_plate_proxy,
+        # Legacy alias retained for compatibility with existing OGS projects.
+        "k_frac": k_parallel_plate_proxy,
         "reynolds": re,
     }
 
@@ -858,16 +1033,10 @@ def compute_reynolds(
 
     Physics background
     ------------------
-    Two distinct thresholds must NOT be conflated:
-
-      Re < 1–10     Darcy (linear) regime — cubic law valid
-      Re ~ 10–100   Forchheimer (nonlinear inertial) regime
-      Re ~ 1200–2300  Turbulent onset (parallel-plate geometry, D_h = 2w)
-
-    The paper text says Re ~ 2000 is "predominantly laminar", which is true
-    in the laminar/turbulent sense, but Darcy's law (which OGS LIQUID_FLOW
-    uses) already breaks down for Re >> 1–10.  These two criteria are
-    independent and must be reported separately.
+    Geometry-specific interpretation (no universal fracture cutoff):
+      Re < ~4        cubic law tends to be most reliable
+      ~4 <= Re < 100 inertial/nonlinear effects grow
+      Re >= 100      strong nonlinearity likely
 
     Formula
     -------
@@ -888,9 +1057,9 @@ def compute_reynolds(
       Re_max    – maximum Re
       Re_mean   – mean Re over open cells (a_closed > 0)
       Re_p95    – 95th-percentile Re
-      darcy_valid_frac   – fraction of cells with Re < 10 (Darcy valid)
-      forchheimer_frac   – fraction with 10 ≤ Re < 2300
-      turbulent_frac     – fraction with Re ≥ 2300
+      lcl_reliable_frac    – fraction of cells with Re < ~4
+      transition_frac      – fraction with ~4 ≤ Re < 100
+      nonlinear_frac       – fraction with Re ≥ 100
       w_max     – maximum aperture [m]
     """
     w = np.maximum(a_closed, 0.0)              # non-negative aperture [m]
@@ -900,18 +1069,22 @@ def compute_reynolds(
     open_mask = w > 0.0
     Re_open   = Re[open_mask]
 
-    darcy_frac       = float(np.mean(Re < 10.0))
-    forchheimer_frac = float(np.mean((Re >= 10.0) & (Re < 2300.0)))
-    turbulent_frac   = float(np.mean(Re >= 2300.0))
+    lcl_reliable_frac = float(np.mean(Re < 4.0))
+    transition_frac   = float(np.mean((Re >= 4.0) & (Re < 100.0)))
+    nonlinear_frac    = float(np.mean(Re >= 100.0))
 
     return {
         "Re":                Re,
         "Re_max":            float(Re.max()),
         "Re_mean":           float(Re_open.mean()) if Re_open.size > 0 else 0.0,
         "Re_p95":            float(np.percentile(Re_open, 95)) if Re_open.size > 0 else 0.0,
-        "darcy_valid_frac":  darcy_frac,
-        "forchheimer_frac":  forchheimer_frac,
-        "turbulent_frac":    turbulent_frac,
+        "lcl_reliable_frac": lcl_reliable_frac,
+        "transition_frac":   transition_frac,
+        "nonlinear_frac":    nonlinear_frac,
+        # Legacy aliases for existing scripts.
+        "darcy_valid_frac":  lcl_reliable_frac,
+        "forchheimer_frac":  transition_frac,
+        "turbulent_frac":    nonlinear_frac,
         "w_max":             float(w.max()),
     }
 
@@ -925,13 +1098,13 @@ def print_reynolds_report(re_dict: dict, label: str = "") -> None:
     print(f"  Re_max         = {re_dict['Re_max']:.1f}")
     print(f"  Re_mean (open) = {re_dict['Re_mean']:.2f}")
     print(f"  Re_p95  (open) = {re_dict['Re_p95']:.2f}")
-    print(f"  Darcy valid  (Re < 10)          : {re_dict['darcy_valid_frac']*100:.1f}% of cells")
-    print(f"  Forchheimer  (10 ≤ Re < 2300)   : {re_dict['forchheimer_frac']*100:.1f}% of cells")
-    print(f"  Turbulent    (Re ≥ 2300)         : {re_dict['turbulent_frac']*100:.1f}% of cells")
-    if re_dict['Re_max'] > 10.0:
-        print("  ⚠  Re_max > 10: cubic law overestimates flow in widest channels")
-    if re_dict['Re_max'] > 2300.0:
-        print("  ⚠  Re_max > 2300: turbulent onset exceeded in widest channels")
+    print(f"  LCL-reliable  (Re < ~4)         : {re_dict['lcl_reliable_frac']*100:.1f}% of cells")
+    print(f"  Transition    (~4 ≤ Re < 100)   : {re_dict['transition_frac']*100:.1f}% of cells")
+    print(f"  Nonlinear     (Re ≥ 100)        : {re_dict['nonlinear_frac']*100:.1f}% of cells")
+    if re_dict['Re_max'] > 4.0:
+        print("  ⚠  Re_max > ~4: inertial effects likely in wider channels")
+    if re_dict['Re_max'] > 100.0:
+        print("  ⚠  Re_max > 100: strong nonlinearity likely")
     print(f"{'─'*55}")
 
 
@@ -968,7 +1141,7 @@ def export_vtu(result: dict, vtu_path: str | Path, cfg: dict) -> str:
     """
     Save aperture / contact / permeability fields to VTU.
     Fields (cell-wise):
-      aperture_raw, aperture_closed, contact, aperture_pos, k_frac
+      aperture_raw, aperture_closed, contact, aperture_pos, k_parallel_plate_proxy
     """
     x, y = result["x"], result["y"]
     grid, _, _ = build_quad_mesh_vtu(x, y, z0=0.0)
@@ -977,7 +1150,9 @@ def export_vtu(result: dict, vtu_path: str | Path, cfg: dict) -> str:
     grid.cell_data["aperture_closed"] = result["a_closed"].ravel(order="C")
     grid.cell_data["contact"]         = result["contact"].ravel(order="C")
     grid.cell_data["aperture_pos"]    = np.maximum(result["a_closed"], 0.0).ravel(order="C")
-    grid.cell_data["k_frac"]          = result["k_frac"].ravel(order="C")
+    grid.cell_data["k_parallel_plate_proxy"] = result["k_parallel_plate_proxy"].ravel(order="C")
+    # Keep legacy field name for existing OGS project files.
+    grid.cell_data["k_frac"] = result["k_parallel_plate_proxy"].ravel(order="C")
 
     vtu_path = Path(vtu_path)
     vtu_path.parent.mkdir(parents=True, exist_ok=True)
@@ -997,8 +1172,8 @@ def main():
     N_SEEDS    = int(cfg.get("n_seeds", 10))
     SEED_BASE  = int(cfg.get("seed", 123))
     SEED_LIST  = [SEED_BASE + i for i in range(N_SEEDS)]
-    OUT_ROOT   = Path(cfg.get("out_root", "_out_sigma_jrc_multi_seed"))
-    OUT_ROOT.mkdir(exist_ok=True)
+    OUT_ROOT   = Path(cfg.get("out_root", "_out/results"))
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     print(f"Grid: {cfg['nx']}×{cfg['ny']} nodes, "
           f"lx={cfg['lx']:.3f} m, ly={cfg['ly']:.3f} m")
